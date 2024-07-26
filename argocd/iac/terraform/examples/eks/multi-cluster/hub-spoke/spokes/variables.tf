@@ -1,11 +1,15 @@
 variable "region" {
   description = "AWS region"
   type        = string
+  default = "us-west-1"
 }
-variable "vpc_cidr" {
-  description = "VPC CIDR"
+
+variable "vpc_id" {
+  description = "VPC ID"
   type        = string
+  default     = "vpc-02a087b9c08c5c165" #id of the terraform scratch vpc
 }
+
 variable "kubernetes_version" {
   description = "EKS version"
   type        = string

@@ -1,8 +1,24 @@
 provider "aws" {
   region = local.region
 }
+
 data "aws_caller_identity" "current" {}
 data "aws_availability_zones" "available" {}
+
+data "aws_vpc" "selected" {
+  id = var.vpc_id
+}
+
+data "aws_subnets" "private" {
+  filter {
+    name   = "vpc-id"
+    values = [var.vpc_id]
+  }
+
+  tags = {
+    Tier = "Private"
+  }
+}
 
 provider "helm" {
   kubernetes {
@@ -37,14 +53,31 @@ locals {
 
   cluster_version = var.kubernetes_version
 
+  vpc_id = var.vpc_id
+
   vpc_cidr = var.vpc_cidr
-  azs      = slice(data.aws_availability_zones.available.names, 0, 3)
+  azs      = slice(data.aws_availability_zones.available.names, 0, 2)
+
+  enable_ingress          = true
+  is_route53_private_zone = true
+  # change to a valid domain name you created a route53 zone
+  # aws route53 create-hosted-zone --name example.com --caller-reference "$(date)"
+  domain_name      = var.domain_name
+  argocd_subdomain = "argocd"
+  argocd_host      = "${local.argocd_subdomain}.${local.domain_name}"
+  route53_zone_arn = try(data.aws_route53_zone.this[0].arn, "")
 
   gitops_addons_url      = "${var.gitops_addons_org}/${var.gitops_addons_repo}"
   gitops_addons_basepath = var.gitops_addons_basepath
   gitops_addons_path     = var.gitops_addons_path
   gitops_addons_revision = var.gitops_addons_revision
 
+  gitops_workload_org      = var.gitops_workload_org
+  gitops_workload_repo     = var.gitops_workload_repo
+  gitops_workload_basepath = var.gitops_workload_basepath
+  gitops_workload_path     = var.gitops_workload_path
+  gitops_workload_revision = var.gitops_workload_revision
+  gitops_workload_url      = "${local.gitops_workload_org}/${local.gitops_workload_repo}"
   argocd_namespace = "argocd"
 
   aws_addons = {
@@ -104,10 +137,12 @@ locals {
       aws_cluster_name = module.eks.cluster_name
       aws_region       = local.region
       aws_account_id   = data.aws_caller_identity.current.account_id
-      aws_vpc_id       = module.vpc.vpc_id
+      aws_vpc_id       = data.aws_vpc.selected.id
     },
     {
-      argocd_namespace    = local.argocd_namespace
+      argocd_namespace    = local.argocd_namespace,
+      argocd_domain               = local.argocd_host
+      external_dns_domain_filters = "[${local.domain_name}]"
     },
     {
       addons_repo_url      = local.gitops_addons_url
@@ -123,8 +158,7 @@ locals {
   }
 
   tags = {
-    Blueprint  = local.name
-    GithubRepo = "github.com/gitops-bridge-dev/gitops-bridge"
+
   }
 }
 
@@ -159,10 +193,12 @@ data "aws_iam_policy_document" "eks_assume" {
     actions = ["sts:AssumeRole","sts:TagSession"]
   }
 }
+
 resource "aws_iam_role" "argocd_hub" {
   name               = "${module.eks.cluster_name}-argocd-hub"
   assume_role_policy = data.aws_iam_policy_document.eks_assume.json
 }
+
 data "aws_iam_policy_document" "aws_assume_policy" {
   statement {
     effect    = "Allow"
@@ -170,22 +206,26 @@ data "aws_iam_policy_document" "aws_assume_policy" {
     actions   = ["sts:AssumeRole","sts:TagSession"]
   }
 }
+
 resource "aws_iam_policy" "aws_assume_policy" {
   name        = "${module.eks.cluster_name}-argocd-aws-assume"
   description = "IAM Policy for ArgoCD Hub"
   policy      = data.aws_iam_policy_document.aws_assume_policy.json
   tags        = local.tags
 }
+
 resource "aws_iam_role_policy_attachment" "aws_assume_policy" {
   role       = aws_iam_role.argocd_hub.name
   policy_arn = aws_iam_policy.aws_assume_policy.arn
 }
+
 resource "aws_eks_pod_identity_association" "argocd_app_controller" {
   cluster_name    = module.eks.cluster_name
   namespace       = "argocd"
   service_account = "argocd-application-controller"
   role_arn        = aws_iam_role.argocd_hub.arn
 }
+
 resource "aws_eks_pod_identity_association" "argocd_api_server" {
   cluster_name    = module.eks.cluster_name
   namespace       = "argocd"
@@ -225,6 +265,8 @@ module "eks_blueprints_addons" {
   enable_velero                       = local.aws_addons.enable_velero
   enable_aws_gateway_api_controller   = local.aws_addons.enable_aws_gateway_api_controller
 
+  external_dns_route53_zone_arns = [local.route53_zone_arn] # ArgoCD Server and UI domain name is registered in Route 53
+
   tags = local.tags
 }
 
@@ -241,8 +283,8 @@ module "eks" {
   cluster_endpoint_public_access = true
 
 
-  vpc_id     = module.vpc.vpc_id
-  subnet_ids = module.vpc.private_subnets
+  vpc_id     = data.aws_vpc.selected.id
+  subnet_ids = data.aws_subnets.private.ids
 
   # Cluster access entry
   # To add the current caller identity as an administrator
@@ -283,6 +325,9 @@ module "eks" {
 ################################################################################
 # Supporting Resources
 ################################################################################
+
+# commenting out vpc creation part as for now we will create this in the same VPC as the target
+/*
 module "vpc" {
   source  = "terraform-aws-modules/vpc/aws"
   version = "~> 5.0"
@@ -296,6 +341,8 @@ module "vpc" {
 
   enable_nat_gateway = true
   single_nat_gateway = true
+  enable_dns_hostnames = true
+  enable_dns_support = true
 
   public_subnet_tags = {
     "kubernetes.io/role/elb" = 1
@@ -307,3 +354,44 @@ module "vpc" {
 
   tags = local.tags
 }
+*/
+
+################################################################################
+# Route 53
+################################################################################
+# To get the hosted zone to be use in argocd domain
+data "aws_route53_zone" "this" {
+  count        = local.enable_ingress ? 1 : 0
+  name         = local.domain_name
+  private_zone = local.is_route53_private_zone
+}
+
+
+################################################################################
+# ACM Certificate
+################################################################################
+
+resource "aws_acm_certificate" "cert" {
+  count             = local.enable_ingress ? 1 : 0
+  domain_name       = "*.${local.domain_name}"
+  validation_method = "DNS"
+}
+
+resource "aws_route53_record" "validation" {
+  count           = local.enable_ingress ? 1 : 0
+  zone_id         = data.aws_route53_zone.this[0].zone_id
+  name            = tolist(aws_acm_certificate.cert[0].domain_validation_options)[0].resource_record_name
+  type            = tolist(aws_acm_certificate.cert[0].domain_validation_options)[0].resource_record_type
+  records         = [tolist(aws_acm_certificate.cert[0].domain_validation_options)[0].resource_record_value]
+  ttl             = 60
+  allow_overwrite = true
+}
+
+/*
+resource "aws_acm_certificate_validation" "this" {
+  count                   = local.enable_ingress ? 1 : 0
+  certificate_arn         = aws_acm_certificate.cert[0].arn
+  validation_record_fqdns = [for record in aws_route53_record.validation : record.fqdn]
+}
+*/
+
